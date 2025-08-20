@@ -1,1 +1,222 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Detector de Mão (Aberta/Fechada)</title>
+  <!-- TensorFlow.js + Teachable Machine (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8.4"></script>
+  <style>
+    :root { --rosa:#ff69b4; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: #0f0f13; color: #fff; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      padding: 24px;
+    }
+    .card {
+      width: 100%; max-width: 420px; background: #17171d; border: 1px solid #26262f;
+      border-radius: 16px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,.35);
+    }
+    h1 { margin: 0 0 12px; font-size: 20px; font-weight: 700; }
+    p.hint { margin: 0 0 16px; opacity: .8; font-size: 14px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+    button {
+      appearance: none; border: 0; padding: 10px 14px; border-radius: 12px; font-weight: 700;
+      background: var(--rosa); color: #111; cursor: pointer;
+    }
+    button.secondary { background: #26262f; color: #fff; }
+    .videoWrap {
+      position: relative; border: 2px solid var(--rosa); border-radius: 16px; overflow: hidden;
+      aspect-ratio: 1 / 1; background: #0b0b0f;
+    }
+    /* tmImage.Webcam usa <canvas>; a gente só o insere aqui */
+    #webcam-container, #overlay {
+      position: absolute; inset: 0; display: grid; place-items: center;
+    }
+    #result {
+      margin-top: 14px; padding: 10px; border-radius: 10px; background: #1e1e25; border: 1px solid #2b2b35;
+      display: grid; gap: 6px; font-size: 15px;
+    }
+    .topline { display: flex; align-items: center; justify-content: space-between; }
+    .badge {
+      padding: 4px 8px; border-radius: 999px; background: #26262f; font-size: 12px; opacity: .9;
+    }
+    .bar { height: 8px; background: #26262f; border-radius: 999px; overflow: hidden; }
+    .bar > i { display: block; height: 100%; width: 0%; background: var(--rosa); }
+    .bigLabel { font-size: 22px; font-weight: 800; letter-spacing: .3px; }
+    .warn { color: #ffbf69; }
+    .ok { color: #9cff69; }
+    .err { color: #ff6b6b; }
+    small.note { display:block; opacity:.7; margin-top:8px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Detector de Mão (Aberta / Fechada)</h1>
+    <p class="hint">Treine no Teachable Machine com as classes <b>Aberta</b> e <b>Fechada</b>, exporte para Web e coloque os arquivos em <code>/modelo</code>.</p>
 
+    <div class="actions">
+      <button id="btnStart">Iniciar câmera</button>
+      <button id="btnToggle" class="secondary" disabled>Alternar câmera</button>
+      <button id="btnStop" class="secondary" disabled>Parar</button>
+    </div>
+
+    <div class="videoWrap" id="videoWrap">
+      <div id="webcam-container"></div>
+    </div>
+
+    <div id="result">
+      <div class="topline">
+        <div class="bigLabel" id="label">Aguardando…</div>
+        <span class="badge" id="conf">—</span>
+      </div>
+      <div class="bar"><i id="barfill"></i></div>
+      <small class="note">Dica: em iPhone, use HTTPS (Netlify/GitHub Pages/Vercel). Toque “Iniciar câmera” e permita o acesso.</small>
+    </div>
+  </div>
+
+  <script>
+    // ====== CONFIGURAÇÃO ======
+    const MODEL_DIR = "./modelo/";      // pasta contendo model.json, metadata.json e os .bin
+    const PREDICTION_INTERVAL = 0;      // 0 = cada frame; ou coloque 50~100ms para aliviar CPU
+    const THRESHOLD = 0.80;             // confiança mínima para "decidir"
+
+    // ====== ESTADO GLOBAL ======
+    let model, webcam, maxPredictions = 0;
+    let running = false;
+    let facing = "environment"; // "environment" (traseira) ou "user" (frontal)
+    let lastPredTime = 0;
+
+    // UI
+    const btnStart = document.getElementById('btnStart');
+    const btnToggle = document.getElementById('btnToggle');
+    const btnStop = document.getElementById('btnStop');
+    const webcamContainer = document.getElementById('webcam-container');
+    const labelEl = document.getElementById('label');
+    const confEl = document.getElementById('conf');
+    const barfill = document.getElementById('barfill');
+
+    btnStart.addEventListener('click', async () => {
+      try {
+        await loadModelIfNeeded();
+        await startWebcam(facing);
+        startLoop();
+        btnStart.disabled = true;
+        btnToggle.disabled = false;
+        btnStop.disabled = false;
+      } catch (e) {
+        labelEl.textContent = 'Erro ao iniciar';
+        labelEl.className = 'bigLabel err';
+        console.error(e);
+        alert('Falha ao iniciar câmera/modelo. Verifique HTTPS e permissões.');
+      }
+    });
+
+    btnToggle.addEventListener('click', async () => {
+      facing = (facing === 'environment') ? 'user' : 'environment';
+      await restartWebcam();
+    });
+
+    btnStop.addEventListener('click', async () => {
+      await stopWebcam();
+      btnStart.disabled = false;
+      btnToggle.disabled = true;
+      btnStop.disabled = true;
+    });
+
+    async function loadModelIfNeeded() {
+      if (model) return;
+      const modelURL = MODEL_DIR + "model.json";
+      const metadataURL = MODEL_DIR + "metadata.json";
+      model = await tmImage.load(modelURL, metadataURL);
+      maxPredictions = model.getTotalClasses();
+    }
+
+    async function startWebcam(facingMode = "environment") {
+      // Se já existir, limpe
+      if (webcam) {
+        try { await webcam.stop(); } catch {}
+        webcamContainer.innerHTML = "";
+      }
+      const flip = (facingMode === 'user'); // espelhar apenas na frontal
+      webcam = new tmImage.Webcam(320, 320, flip);
+      await webcam.setup({ facingMode });
+      await webcam.play();
+      // Em tmImage, a visualização recomendada é o canvas interno
+      webcamContainer.appendChild(webcam.canvas);
+      running = true;
+      labelEl.textContent = 'Rodando…';
+      labelEl.className = 'bigLabel';
+      confEl.textContent = '—';
+      barfill.style.width = '0%';
+    }
+
+    async function restartWebcam() {
+      const isOn = running;
+      await stopWebcam();
+      if (isOn) {
+        await startWebcam(facing);
+      }
+    }
+
+    async function stopWebcam() {
+      running = false;
+      if (webcam) {
+        try { await webcam.stop(); } catch {}
+      }
+      labelEl.textContent = 'Parado';
+      labelEl.className = 'bigLabel warn';
+      confEl.textContent = '—';
+      barfill.style.width = '0%';
+    }
+
+    function startLoop() {
+      async function loop() {
+        if (!running) return;
+        webcam.update(); // desenha no canvas
+        const now = performance.now();
+        if (now - lastPredTime >= PREDICTION_INTERVAL) {
+          await predict();
+          lastPredTime = now;
+        }
+        requestAnimationFrame(loop);
+      }
+      requestAnimationFrame(loop);
+    }
+
+    async function predict() {
+      if (!model || !webcam) return;
+      const predictions = await model.predict(webcam.canvas);
+      // Ordene por maior probabilidade:
+      predictions.sort((a, b) => b.probability - a.probability);
+      const top = predictions[0];
+
+      const pct = Math.round(top.probability * 100);
+      confEl.textContent = pct + '%';
+      barfill.style.width = pct + '%';
+
+      // Se você nomeou as classes no TM como "Aberta" e "Fechada", mostramos com ícone:
+      const name = top.className.trim().toLowerCase();
+      let pretty = top.className;
+      if (name.includes('aberta')) pretty = '🖐️ Aberta';
+      if (name.includes('fechada')) pretty = '✊ Fechada';
+
+      if (top.probability >= THRESHOLD) {
+        labelEl.textContent = pretty;
+        labelEl.className = 'bigLabel ok';
+      } else {
+        labelEl.textContent = `Indefinido (${pretty})`;
+        labelEl.className = 'bigLabel warn';
+      }
+    }
+
+    // Aviso amigável se não for HTTPS
+    if (!window.isSecureContext && location.hostname !== 'localhost') {
+      labelEl.textContent = 'Use HTTPS para câmera no iPhone';
+      labelEl.className = 'bigLabel warn';
+    }
+  </script>
+</body>
+</html>
